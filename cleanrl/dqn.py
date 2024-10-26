@@ -4,6 +4,8 @@ import random
 import time
 from dataclasses import dataclass
 
+from env import TickersEnv
+
 import gymnasium as gym
 import numpy as np
 import torch
@@ -13,6 +15,19 @@ import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
+
+import sys
+import os
+
+# Add the parent directory to the Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from cleanrl_utils.evals.dqn_eval import evaluate
+
+gym.register(
+    id="TickersEnv-v0",
+    entry_point=TickersEnv,
+)
 
 
 @dataclass
@@ -25,7 +40,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
@@ -41,9 +56,9 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
+    env_id: str = "TickersEnv-v0"
     """the id of the environment"""
-    total_timesteps: int = 500000
+    total_timesteps: int = 500000000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
@@ -85,13 +100,100 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
+import torch
+import torch.nn as nn
+import numpy as np
+
+class QNetworkTrans(nn.Module):
+    def __init__(self, env, d_model=256, nhead=8, num_layers=6, dim_feedforward=1024, dropout=0.1):
+        super().__init__()
+        
+        input_dim = np.array(env.single_observation_space.shape).prod()
+        
+        # Input embedding
+        self.embed = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU()
+        )
+        
+        # Positional encoding (even though we have only one token, this is standard in transformers)
+        self.pos_encoding = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout, 
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Output layers
+        self.fc_out = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Linear(dim_feedforward, dim_feedforward // 2),
+            nn.ReLU(),
+            nn.Linear(dim_feedforward // 2, env.single_action_space.n)
+        )
+
+    def forward(self, x):
+        # Add a sequence dimension and embed
+        x = x.unsqueeze(1)
+        x = self.embed(x)
+        
+        # Add positional encoding
+        x = x + self.pos_encoding
+        
+        # Pass through transformer
+        x = self.transformer_encoder(x)
+        
+        # Take the output of the last token and pass through output layers
+        x = x.squeeze(1)
+        return self.fc_out(x)
+    
+
+class QNetwork(nn.Module):
+    def __init__(self, env, hidden_sizes=[512, 512, 256, 256], dropout_rate=0.1):
+        super().__init__()
+        input_dim = np.array(env.single_observation_space.shape).prod()
+        output_dim = env.single_action_space.n
+
+        layers = []
+        prev_size = input_dim
+        for hidden_size in hidden_sizes:
+            layers.extend([
+                nn.Linear(prev_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            ])
+            prev_size = hidden_size
+
+        self.feature_extractor = nn.Sequential(*layers)
+        
+        self.value_head = nn.Linear(hidden_sizes[-1], 1)
+        self.advantage_head = nn.Linear(hidden_sizes[-1], output_dim)
+
+    def forward(self, x):
+        features = self.feature_extractor(x)
+        value = self.value_head(features)
+        advantages = self.advantage_head(features)
+        return value + (advantages - advantages.mean(dim=-1, keepdim=True))
 
 # ALGO LOGIC: initialize agent here:
-class QNetwork(nn.Module):
+class QNetworkLegacy(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(np.array(env.single_observation_space.shape).prod(), 120),
+            nn.ReLU(),
+            nn.Linear(120, 120),
             nn.ReLU(),
             nn.Linear(120, 84),
             nn.ReLU(),
@@ -225,6 +327,24 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     target_network_param.data.copy_(
                         args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                     )
+
+        if global_step % 10000 == 0:
+            model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+            torch.save(q_network.state_dict(), model_path)
+            print(f"model saved to {model_path}")
+            episodic_returns = evaluate(
+                model_path,
+                make_env,
+                args.env_id,
+                eval_episodes=1,
+                run_name=f"{run_name}-eval",
+                Model=QNetwork,
+                device=device,
+                epsilon=0.05,
+            )
+            writer.add_scalar("eval/episodic_return", episodic_returns[0], global_step)
+
+            writer.add_scalar("eval/episodic_return_pos", max(0.0, episodic_returns[0][0]), global_step)
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"

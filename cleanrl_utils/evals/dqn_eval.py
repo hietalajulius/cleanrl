@@ -15,14 +15,14 @@ def evaluate(
     Model: torch.nn.Module,
     device: torch.device = torch.device("cpu"),
     epsilon: float = 0.05,
-    capture_video: bool = True,
+    capture_video: bool = False,
 ):
     envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name)])
     model = Model(envs).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    obs, _ = envs.reset()
+    obs, _ = envs.reset(options={"test": True})
     episodic_returns = []
     while len(episodic_returns) < eval_episodes:
         if random.random() < epsilon:
